@@ -154,7 +154,7 @@ async fn admin_report(identity: ClientIdentity) -> Result<String, PortfuError> {
 }
 ```
 
-WebSocket options are route-local. Portfu performs admission before returning `101`, then owns and tracks the upgraded task so `ServerHandle::shutdown()` can cancel it and wait up to the configured drain grace period. HTTP connections and background tasks are tracked by the same server runtime; HTTP requests already in flight are drained with Hyper's graceful shutdown behavior. `ConnectionInfo` is extractable before upgrade and remains available through `WebSocket::connection_info()` afterward.
+WebSocket options are route-local. Portfu performs admission before returning `101`, then owns and tracks the upgraded task. A graceful stop closes the socket and awaits its admitted handler. HTTP connections and background tasks are tracked by the same server runtime; HTTP requests already in flight are drained with Hyper's graceful shutdown behavior. `ConnectionInfo` is extractable before upgrade and remains available through `WebSocket::connection_info()` afterward.
 
 ```rust
 #[websocket(
@@ -176,7 +176,11 @@ async fn peer_socket(
 
 Register server-wide WebSocket admission with `ServerBuilder::websocket_admission`. An admission middleware can reject a banned peer or an exhausted connection limit before the protocol switches, or return a `WebSocketAdmissionPermit` whose lifetime lasts until disconnect. Configure draining for HTTP connections, WebSockets, and background tasks with `ServerBuilder::shutdown_grace_period`. The first termination signal begins graceful shutdown; a second signal force-cancels tracked work and exits the process immediately.
 
-For programmatic control, call `ServerHandle::shutdown()` to drain or `ServerHandle::force_shutdown()` to cancel tracked work immediately. The latter does not exit the process; immediate process termination is reserved for the second OS termination signal.
+For programmatic control, `ServerHandle::shutdown()` requests graceful drain and returns immediately. Await `Server::run()` to observe completion. `ServerHandle::wait_shutdown()` observes the stop request only. Intervals wake on shutdown between callbacks; an already running callback remains tracked until it returns or forced cancellation occurs.
+
+`Server::run()` returns `PortfuError::ShutdownIncomplete` if a tracked worker panics, a background task returns an error, or the graceful deadline requires cancellation. This failure remains recorded after the worker exits. On deadline expiry, the runtime cancels tracked work and waits for its futures to end before returning the error. The grace period therefore bounds cooperative draining, not total shutdown time. Ordinary HTTP/WebSocket application refusals remain distinct from failed runtime completion.
+
+`ServerHandle::force_shutdown()` requests immediate cancellation of tracked work; it does not await completion or exit the process. Continue awaiting `Server::run()` for its completion result. Immediate process termination is reserved for the second OS termination signal.
 
 TLS handshakes and HTTP header reads are bounded by default. Customize them with `TlsConfig::handshake_timeout` and `ServerBuilder::http_header_read_timeout`. Forwarded client-IP headers are ignored unless `ServerBuilder::trust_proxy_headers(true)` is explicitly enabled; only enable that option when direct traffic is restricted to a trusted reverse proxy.
 
