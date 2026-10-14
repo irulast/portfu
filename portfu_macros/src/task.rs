@@ -95,7 +95,13 @@ impl Task {
                     if !server.run.load(::std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    ticker.tick().await;
+                    ::tokio::select! {
+                        () = server.wait_shutdown() => break,
+                        _ = ticker.tick() => {}
+                    }
+                    if !server.run.load(::std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     #(#dyn_vars)*
                     #name(#(#args)*).await?;
                 }
@@ -122,6 +128,9 @@ impl Task {
                             .get("default")
                             .cloned()
                             .unwrap_or_default();
+                        // The task owns this reference until it completes. The
+                        // server's persistent state must never own itself.
+                        extensions.insert(server.clone());
                         if #scope != "default" {
                             if let Some(scope_extensions) = scoped_state.get(#scope) {
                                 extensions.extend(scope_extensions.clone());

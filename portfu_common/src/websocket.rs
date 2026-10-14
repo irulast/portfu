@@ -181,15 +181,21 @@ where
         )
         .await;
         let websocket = WebSocket::with_peers(websocket, peers, connection).await;
-        tokio::select! {
+        let handling = handler(websocket.clone());
+        tokio::pin!(handling);
+        let result = tokio::select! {
             _ = cancellation.cancelled() => {
                 let _ = timeout(Duration::from_secs(1), websocket.close()).await;
+                // The admitted handler may still own application work. Keep it
+                // until it settles; the runtime deadline handles non-cooperation.
+                handling.await
             }
-            result = handler(websocket.clone()) => {
-                if let Err(error) = result {
-                    log::error!("WebSocket handler exited with error: {error:?}");
-                }
-            }
+            result = &mut handling => result,
+        };
+        if let Err(error) = result {
+            // A normally returned protocol/application refusal is distinct from
+            // a panic or missing completion of the enclosing tracked worker.
+            log::error!("WebSocket handler exited with error: {error:?}");
         }
         let _ = websocket.leave().await;
     });

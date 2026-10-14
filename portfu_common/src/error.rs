@@ -12,6 +12,8 @@ pub enum PortfuError {
     PayloadTooLarge(String),
     RequestTimeout(String),
     Internal(String),
+    /// Runtime work panicked, failed, or was forcibly abandoned during shutdown.
+    ShutdownIncomplete,
     Io(std::io::Error),
 }
 
@@ -25,6 +27,7 @@ impl Display for PortfuError {
             PortfuError::PayloadTooLarge(msg) => write!(f, "{}", msg),
             PortfuError::RequestTimeout(msg) => write!(f, "{}", msg),
             PortfuError::Internal(msg) => write!(f, "{}", msg),
+            PortfuError::ShutdownIncomplete => f.write_str("server runtime completion is unproved"),
             PortfuError::Io(e) => write!(f, "{}", e),
         }
     }
@@ -40,6 +43,7 @@ impl std::error::Error for PortfuError {
             PortfuError::PayloadTooLarge(_) => None,
             PortfuError::RequestTimeout(_) => None,
             PortfuError::Internal(_) => None,
+            PortfuError::ShutdownIncomplete => None,
             PortfuError::Io(e) => Some(e),
         }
     }
@@ -53,13 +57,15 @@ impl ResponseError for PortfuError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestTimeout(_) => StatusCode::REQUEST_TIMEOUT,
-            Self::Internal(_) | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal(_) | Self::Io(_) | Self::ShutdownIncomplete => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 
     fn error_response(&self) -> Response {
         let message = match self {
-            Self::Internal(_) | Self::Io(_) => "Internal Server Error",
+            Self::Internal(_) | Self::Io(_) | Self::ShutdownIncomplete => "Internal Server Error",
             _ => return Response::from_status_and_message(self.status_code(), self.to_string()),
         };
         Response::from_status_and_message(self.status_code(), message)

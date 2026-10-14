@@ -67,6 +67,11 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Observe a stop request without polling an application timer.
+    pub async fn wait_shutdown(&self) {
+        self.runtime.cancellation().cancelled().await;
+    }
+
     /// Stops admission and accepting, then drains tracked work for the configured grace period.
     pub fn shutdown(&self) {
         self.run.store(false, Ordering::Relaxed);
@@ -115,6 +120,11 @@ pub struct Server {
     pub(crate) websocket_admission: Vec<Arc<dyn WebSocketAdmissionMiddleware + Send + Sync>>,
 }
 impl Server {
+    /// Wake an idle registered interval when server shutdown is requested.
+    pub async fn wait_shutdown(&self) {
+        self.runtime.cancellation().cancelled().await;
+    }
+
     pub fn handle(&self) -> ServerHandle {
         ServerHandle {
             run: self.run.clone(),
@@ -125,16 +135,6 @@ impl Server {
 
     pub async fn run(self) -> Result<(), PortfuError> {
         let server = Arc::new(self);
-        {
-            let slf = server.clone();
-            server
-                .scoped_state
-                .write()
-                .await
-                .entry(DEFAULT_SCOPE.to_string())
-                .or_default()
-                .insert(slf);
-        }
         let socket_addr = SocketAddr::from((
             server
                 .config
@@ -220,8 +220,10 @@ impl Server {
         for task in inventory::iter::<TaskRegistration> {
             let server = server.clone();
             let runtime = server.runtime.clone();
+            let completion = runtime.clone();
             runtime.spawn_background(async move {
                 if let Err(e) = (task.run)(server).await {
+                    completion.record_failure();
                     error!("Background task failed: {e:?}");
                 }
             });
@@ -350,19 +352,23 @@ impl Server {
         }
         info!("Got Shutdown Signal");
         for handle in acceptor_handles {
-            let _ = handle.await;
+            if let Err(error) = handle.await {
+                server.runtime.record_failure();
+                error!("Acceptor completion failed: {error}");
+            }
         }
-        if !server
+        let drained = server
             .runtime
             .drain(server.config.shutdown_grace_period)
-            .await
-        {
-            warn!("Timed out while draining server connections and tasks");
-        }
+            .await;
         signal_task.abort();
-        let _ = signal_task.await;
+        let signal_failed = matches!(signal_task.await, Err(error) if !error.is_cancelled());
         info!("Server Exiting");
-        Ok(())
+        if drained && !signal_failed {
+            Ok(())
+        } else {
+            Err(PortfuError::ShutdownIncomplete)
+        }
     }
 
     fn bind_listener(
@@ -392,7 +398,13 @@ impl Server {
         request: http::Request<Incoming>,
         connection_info: ConnectionInfo,
     ) -> Result<http::Response<StreamingBody>, PortfuError> {
-        let scoped_state = server.scoped_state.read().await.clone();
+        // Request-local state owns the server only for the admitted request.
+        // Putting this Arc in the server's persistent state creates a cycle.
+        let mut scoped_state = server.scoped_state.read().await.clone();
+        scoped_state
+            .entry(DEFAULT_SCOPE.to_string())
+            .or_default()
+            .insert(server.clone());
         let mut request = Request::new(
             RequestType::Stream(request.map(|b| b.stream_body())),
             DEFAULT_ROUTE.clone(),
